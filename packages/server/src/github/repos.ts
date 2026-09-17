@@ -39,6 +39,7 @@ interface RepoNode {
 interface ReposResponse {
   viewer: {
     repositories: {
+      totalCount: number;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
       nodes: RepoNode[];
     };
@@ -59,6 +60,7 @@ const REPOS_QUERY = `
     viewer {
       repositories(first: $pageSize, after: $cursor, ownerAffiliations: OWNER,
                    orderBy: { field: PUSHED_AT, direction: DESC }) {
+        totalCount
         pageInfo { hasNextPage endCursor }
         nodes {
           name
@@ -162,11 +164,11 @@ function isGatewayTimeout(error: unknown): boolean {
   return status === 502 || status === 504;
 }
 
-/** リポジトリ一覧をページ送りし、1 件ごとに onRepo を呼ぶ */
+/** リポジトリ一覧をページ送りし、ページごとに onPage を呼ぶ */
 async function forEachRepo(
   octokit: Octokit,
   pageSize: number,
-  onRepo: (node: RepoNode) => void,
+  onPage: (page: ReposResponse["viewer"]["repositories"]) => void,
 ): Promise<void> {
   let cursor: string | null = null;
   for (;;) {
@@ -179,31 +181,61 @@ async function forEachRepo(
       pageSize = Math.max(MIN_REPO_PAGE_SIZE, Math.floor(pageSize / 2));
       continue;
     }
-    const { nodes, pageInfo } = res.viewer.repositories;
-    nodes.forEach(onRepo);
+    const { pageInfo } = res.viewer.repositories;
+    onPage(res.viewer.repositories);
     if (!pageInfo.hasNextPage || !pageInfo.endCursor) return;
     cursor = pageInfo.endCursor;
   }
 }
 
+export interface RepoFetchProgress {
+  /** 一覧で取得済みのリポジトリ数 */
+  repos: number;
+  /** 所有リポジトリの総数（1 ページ目を取得するまでは null） */
+  reposTotal: number | null;
+  /** Alert が 100 件を超え、続きの取得が必要なリポジトリ数 */
+  followUpsTotal: number;
+  /** 続きの取得が終わったリポジトリ数 */
+  followUpsDone: number;
+}
+
 /** 認証ユーザーが所有するリポジトリと、未対応 Alert の重大度別件数を取得する */
 export async function fetchRepoSummaries(
   octokit: Octokit,
-  pageSize: number = REPO_PAGE_SIZE,
+  options: { pageSize?: number; onProgress?: (progress: RepoFetchProgress) => void } = {},
 ): Promise<RepoSummary[]> {
+  const { pageSize = REPO_PAGE_SIZE, onProgress } = options;
+  const progress: RepoFetchProgress = {
+    repos: 0,
+    reposTotal: null,
+    followUpsTotal: 0,
+    followUpsDone: 0,
+  };
+  const report = () => onProgress?.({ ...progress });
   const summaries: RepoSummary[] = [];
   const limit = createLimiter(FOLLOW_UP_CONCURRENCY);
   // 一覧のページ送りと並行して、100 件を超える Alert の続きを取得する
   const followUps: Promise<void>[] = [];
 
   try {
-    await forEachRepo(octokit, pageSize, (node) => {
-      const summary = toSummary(node);
-      summaries.push(summary);
-      const { pageInfo } = node.vulnerabilityAlerts;
-      if (pageInfo.hasNextPage) {
-        followUps.push(limit(() => fetchRemainingSeverities(octokit, summary, pageInfo.endCursor)));
+    await forEachRepo(octokit, pageSize, (page) => {
+      progress.reposTotal = page.totalCount;
+      for (const node of page.nodes) {
+        const summary = toSummary(node);
+        summaries.push(summary);
+        progress.repos += 1;
+        const { pageInfo } = node.vulnerabilityAlerts;
+        if (!pageInfo.hasNextPage) continue;
+        progress.followUpsTotal += 1;
+        const followUp = limit(() => fetchRemainingSeverities(octokit, summary, pageInfo.endCursor));
+        followUps.push(
+          followUp.then(() => {
+            progress.followUpsDone += 1;
+            report();
+          }),
+        );
       }
+      report();
     });
   } catch (error) {
     // 並行中の追加取得の失敗が未処理の reject にならないようにする

@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cached, type Cache } from "./db/cache.js";
 import { AlertsDisabledError } from "./github/alerts.js";
 import { GitHubAuthError } from "./github/client.js";
+import { REPOS_CACHE_KEY, RepoRefresher } from "./github/refresh.js";
 import type { GitHubService } from "./github/service.js";
 import type { AlertState, DependabotAlert, RepoSummary } from "./types.js";
 
@@ -14,13 +15,25 @@ const ALERT_STATES: AlertState[] = ["open", "dismissed", "fixed", "auto_dismisse
 
 export function createApp({ github, cache }: AppDeps) {
   const app = new Hono().basePath("/api");
+  const refresher = new RepoRefresher(github, cache);
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 
-  app.get("/repos", async (c) => {
-    const refresh = c.req.query("refresh") === "1";
-    const entry = await cached<RepoSummary[]>(cache, "repos", refresh, () => github.listRepos());
-    return c.json({ repos: entry.value, fetchedAt: entry.fetchedAt });
+  // キャッシュ済みの一覧と取得状況を返す。
+  // キャッシュがなければ取得を開始する（失敗後は POST /repos/refresh で再試行する）
+  app.get("/repos", (c) => {
+    const entry = cache.get<RepoSummary[]>(REPOS_CACHE_KEY);
+    if (!entry && !refresher.getStatus().error) void refresher.start();
+    return c.json({
+      repos: entry?.value ?? null,
+      fetchedAt: entry?.fetchedAt ?? null,
+      refresh: refresher.getStatus(),
+    });
+  });
+
+  app.post("/repos/refresh", (c) => {
+    void refresher.start();
+    return c.json({ refresh: refresher.getStatus() }, 202);
   });
 
   app.get("/repos/:owner/:repo/alerts", async (c) => {

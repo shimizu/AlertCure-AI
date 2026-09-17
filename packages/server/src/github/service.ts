@@ -2,16 +2,16 @@ import type { Octokit } from "@octokit/rest";
 import type { AlertState, DependabotAlert, RepoSummary } from "../types.js";
 import { listDependabotAlerts } from "./alerts.js";
 import { createOctokit } from "./client.js";
-import { fetchRepoSummaries } from "./repos.js";
+import { fetchRepoSummaries, type RepoFetchProgress } from "./repos.js";
 
 export interface GitHubService {
-  listRepos(): Promise<RepoSummary[]>;
+  listRepos(onProgress?: (progress: RepoFetchProgress) => void): Promise<RepoSummary[]>;
   listAlerts(owner: string, repo: string, state?: AlertState): Promise<DependabotAlert[]>;
 }
 
 export function createGitHubService(getOctokit: () => Promise<Octokit> = memoizedOctokit()): GitHubService {
   return {
-    listRepos: async () => fetchRepoSummaries(await getOctokit()),
+    listRepos: async (onProgress) => fetchRepoSummaries(await getOctokit(), { onProgress }),
     listAlerts: async (owner, repo, state) => listDependabotAlerts(await getOctokit(), owner, repo, state),
   };
 }

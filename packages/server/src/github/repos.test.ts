@@ -49,6 +49,7 @@ describe("fetchRepoSummaries", () => {
             data: {
               viewer: {
                 repositories: {
+                  totalCount: 3,
                   pageInfo: { hasNextPage: true, endCursor: "R1" },
                   nodes: [
                     repoNode("big", {
@@ -65,6 +66,7 @@ describe("fetchRepoSummaries", () => {
           data: {
             viewer: {
               repositories: {
+                totalCount: 3,
                 pageInfo: { hasNextPage: false, endCursor: null },
                 nodes: [repoNode("small", { vulnerabilityAlerts: alerts(["LOW", "HIGH"], null) })],
               },
@@ -81,9 +83,11 @@ describe("fetchRepoSummaries", () => {
       }),
     );
 
-    const repos = await fetchRepoSummaries(octokit);
+    const progress: unknown[] = [];
+    const repos = await fetchRepoSummaries(octokit, { onProgress: (p) => progress.push(p) });
 
     expect(repoCursors).toEqual([null, "R1"]);
+    expect(progress.at(-1)).toEqual({ repos: 3, reposTotal: 3, followUpsTotal: 1, followUpsDone: 1 });
     expect(alertCursors).toEqual(["A1", "A2"]);
     expect(repos.map((r) => r.fullName)).toEqual(["octo/big", "octo/off", "octo/small"]);
     expect(repos[0]!.openAlerts).toEqual({ total: 5, critical: 1, high: 2, medium: 2, low: 0 });
@@ -101,6 +105,7 @@ describe("fetchRepoSummaries", () => {
           data: {
             viewer: {
               repositories: {
+                totalCount: 1,
                 pageInfo: { hasNextPage: false, endCursor: null },
                 nodes: [repoNode("only")],
               },
@@ -110,7 +115,7 @@ describe("fetchRepoSummaries", () => {
       }),
     );
 
-    const repos = await fetchRepoSummaries(octokit, 20);
+    const repos = await fetchRepoSummaries(octokit, { pageSize: 20 });
 
     expect(calls).toEqual([
       { cursor: null, pageSize: 20 },
@@ -122,6 +127,6 @@ describe("fetchRepoSummaries", () => {
 
   it("gives up when the minimum page size still fails", async () => {
     server.use(graphql.query("Repos", () => new HttpResponse("Bad Gateway", { status: 502 })));
-    await expect(fetchRepoSummaries(octokit, 4)).rejects.toMatchObject({ status: 502 });
+    await expect(fetchRepoSummaries(octokit, { pageSize: 4 })).rejects.toMatchObject({ status: 502 });
   });
 });
