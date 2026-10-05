@@ -54,7 +54,7 @@ GitHub の個人アカウント (shimizu) には、公開/非公開あわせて�
 | パッケージ構成 | npm workspaces（`server` と `web` の2パッケージ） |
 | サーバー | Hono + `@hono/node-server` + `ws` |
 | GitHub API | `@octokit/rest`, `@octokit/graphql` |
-| エージェント | `@anthropic-ai/claude-agent-sdk`（モデル: `claude-opus-5`、設定で `claude-sonnet-5` に切り替え可能） |
+| エージェント | `@anthropic-ai/claude-agent-sdk`（モデル: `claude-opus-5-5`、`ALERTCURE_MODEL` で `claude-sonnet-5-5` などに切り替え可能） |
 | DB | `node:sqlite`（Node 標準、追加の依存なし） |
 | フロントエンド | React + Vite + TanStack Query / Table、スタイルは Tailwind |
 | テスト | Vitest（GitHub API は msw でモック） |

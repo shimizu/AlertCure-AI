@@ -1,10 +1,11 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { SEVERITY_LABEL, SEVERITY_STYLE, SeverityBadge } from "../components/Severity";
 import { Button, Card, Notice, Spinner, Tag } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { countBySeverity, countPackages, filterAlerts, sortAlerts } from "../lib/alertTable";
 import { formatDate, formatRelative, numberFormat } from "../lib/format";
+import { sessionHref } from "../lib/router";
 import { SEVERITY_ORDER, type AlertState, type DependabotAlert, type Severity } from "../lib/types";
 
 const STATE_TABS: { state: AlertState; label: string }[] = [
@@ -65,6 +66,13 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
       }
       return next;
     });
+
+  const startSession = useMutation({
+    mutationFn: () => api.createSession(owner, repo, [...selected].sort((a, b) => a - b)),
+    onSuccess: (session) => {
+      window.location.hash = sessionHref(owner, repo, session.id);
+    },
+  });
 
   const disabled = alertsQuery.error instanceof ApiError && alertsQuery.error.code === "alerts_disabled";
 
@@ -201,9 +209,16 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
             <p className="text-sm">
               選択中: <span className="font-semibold tabular-nums">{numberFormat.format(selected.size)}</span> 件
             </p>
-            <Button variant="primary" className="w-full justify-center" disabled title="ステップ4で実装予定">
-              エージェントと相談する（準備中）
+            <Button
+              variant="primary"
+              className="w-full justify-center"
+              disabled={state !== "open" || selected.size === 0 || startSession.isPending}
+              onClick={() => startSession.mutate()}
+            >
+              {startSession.isPending && <Spinner />} エージェントと相談する
             </Button>
+            {state !== "open" && <p className="text-xs text-slate-500">未対応の Alert を選んでください。</p>}
+            {startSession.error && <Notice tone="error">{startSession.error.message}</Notice>}
           </Card>
         </div>
       )}

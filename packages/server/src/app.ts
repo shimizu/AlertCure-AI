@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { SessionManager } from "./agent/session.js";
 import { cached, type Cache } from "./db/cache.js";
 import { AlertsDisabledError } from "./github/alerts.js";
 import { GitHubAuthError } from "./github/client.js";
@@ -9,11 +10,12 @@ import type { AlertState, DependabotAlert, RepoSummary } from "./types.js";
 export interface AppDeps {
   github: GitHubService;
   cache: Cache;
+  sessions: SessionManager;
 }
 
 const ALERT_STATES: AlertState[] = ["open", "dismissed", "fixed", "auto_dismissed"];
 
-export function createApp({ github, cache }: AppDeps) {
+export function createApp({ github, cache, sessions }: AppDeps) {
   const app = new Hono().basePath("/api");
   const refresher = new RepoRefresher(github, cache);
 
@@ -47,6 +49,32 @@ export function createApp({ github, cache }: AppDeps) {
       github.listAlerts(owner, repo, state as AlertState),
     );
     return c.json({ alerts: entry.value, fetchedAt: entry.fetchedAt });
+  });
+
+  app.post("/sessions", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as {
+      owner?: unknown;
+      repo?: unknown;
+      alertNumbers?: unknown;
+    } | null;
+    const { owner, repo, alertNumbers } = body ?? {};
+    if (
+      typeof owner !== "string" ||
+      typeof repo !== "string" ||
+      !Array.isArray(alertNumbers) ||
+      alertNumbers.length === 0 ||
+      !alertNumbers.every((n) => Number.isInteger(n) && n > 0)
+    ) {
+      return c.json({ error: "owner, repo, alertNumbers（1件以上の Alert 番号）を指定してください。" }, 400);
+    }
+    const session = sessions.create(owner, repo, alertNumbers as number[]);
+    return c.json(session.info(), 201);
+  });
+
+  app.get("/sessions/:id", (c) => {
+    const session = sessions.get(c.req.param("id"));
+    if (!session) return c.json({ error: "セッションが見つかりません。サーバーを再起動した場合は、もう一度開始してください。" }, 404);
+    return c.json(session.info());
   });
 
   app.onError((error, c) => {

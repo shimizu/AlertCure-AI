@@ -1,4 +1,4 @@
-import type { AlertState, DependabotAlert, RefreshStatus, RepoSummary } from "./types";
+import type { AlertState, DependabotAlert, RefreshStatus, RepoSummary, SessionInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -41,4 +41,11 @@ export const api = {
       `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/alerts?${params}`,
     );
   },
+  createSession: (owner: string, repo: string, alertNumbers: number[]) =>
+    request<SessionInfo>("/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner, repo, alertNumbers }),
+    }),
+  getSession: (id: string) => request<SessionInfo>(`/api/sessions/${encodeURIComponent(id)}`),
 };

@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Dashboard } from "./pages/Dashboard";
 import { RepoDetail } from "./pages/RepoDetail";
+import { Session } from "./pages/Session";
 import { useRoute } from "./lib/router";
 
 const queryClient = new QueryClient({
@@ -22,7 +23,9 @@ export function App() {
           </div>
         </header>
         <main className="mx-auto max-w-7xl px-4 py-6">
-          {route.name === "repo" ? (
+          {route.name === "session" ? (
+            <Session key={route.id} owner={route.owner} repo={route.repo} id={route.id} />
+          ) : route.name === "repo" ? (
             <RepoDetail key={`${route.owner}/${route.repo}`} owner={route.owner} repo={route.repo} />
           ) : (
             <Dashboard />

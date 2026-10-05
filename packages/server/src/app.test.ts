@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SessionManager } from "./agent/session.js";
 import { createApp } from "./app.js";
 import { Cache } from "./db/cache.js";
 import { AlertsDisabledError } from "./github/alerts.js";
@@ -24,12 +25,19 @@ const repo: RepoSummary = {
 describe("API", () => {
   let cache: Cache;
   let github: { listRepos: ReturnType<typeof vi.fn>; listAlerts: ReturnType<typeof vi.fn> };
+  let sessions: { create: ReturnType<typeof vi.fn>; get: ReturnType<typeof vi.fn> };
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
     cache = new Cache(":memory:");
     github = { listRepos: vi.fn(async () => [repo]), listAlerts: vi.fn(async () => []) };
-    app = createApp({ github: github as unknown as GitHubService, cache });
+    const info = { id: "s1", owner: "octo", repo: "app", alertNumbers: [1], status: "preparing", workspace: null, createdAt: "" };
+    sessions = { create: vi.fn(() => ({ info: () => info })), get: vi.fn(() => undefined) };
+    app = createApp({
+      github: github as unknown as GitHubService,
+      cache,
+      sessions: sessions as unknown as SessionManager,
+    });
   });
   afterEach(() => cache.close());
 
@@ -96,5 +104,25 @@ describe("API", () => {
     const res = await app.request("/api/repos/octo/app/alerts");
     expect(res.status).toBe(401);
     expect((await res.json()).code).toBe("github_auth");
+  });
+
+  it("POST /api/sessions validates input and starts a session", async () => {
+    const post = (body: unknown) =>
+      app.request("/api/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    expect((await post({ owner: "octo", repo: "app", alertNumbers: [] })).status).toBe(400);
+    expect((await post({ owner: "octo", repo: "app", alertNumbers: [1.5] })).status).toBe(400);
+
+    const res = await post({ owner: "octo", repo: "app", alertNumbers: [1, 2] });
+    expect(res.status).toBe(201);
+    expect((await res.json()).id).toBe("s1");
+    expect(sessions.create).toHaveBeenCalledWith("octo", "app", [1, 2]);
+  });
+
+  it("GET /api/sessions/:id returns 404 for unknown sessions", async () => {
+    expect((await app.request("/api/sessions/nope")).status).toBe(404);
   });
 });

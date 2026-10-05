@@ -7,6 +7,8 @@ export type {
   SeverityCounts,
 } from "../../../server/src/types";
 
+export type { ClientMessage, ServerEvent, SessionInfo, SessionStatus } from "../../../server/src/agent/events";
+
 import type { Severity } from "../../../server/src/types";
 
 export const SEVERITY_ORDER: Severity[] = ["critical", "high", "medium", "low"];
