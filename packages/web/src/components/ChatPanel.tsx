@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { describeTool, type ChatItem, type ChatState } from "../lib/chat";
+import { describeTool, pendingApprovals, type ChatItem, type ChatState } from "../lib/chat";
 import { Button, Spinner } from "./ui";
 
 const STATUS_LABEL = {
@@ -40,6 +40,7 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null);
   const { status } = state;
   const canSend = connected && status === "idle" && draft.trim().length > 0;
+  const waitingApproval = pendingApprovals(state).length > 0;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
@@ -64,7 +65,9 @@ export function ChatPanel({
         ))}
         {(status === "preparing" || status === "running") && (
           <p className="flex items-center gap-2 text-sm text-slate-500">
-            <Spinner /> {state.statusDetail ?? (status === "preparing" ? "準備しています…" : "考えています…")}
+            <Spinner />{" "}
+            {state.statusDetail ??
+              (status === "preparing" ? "準備しています…" : waitingApproval ? "承認を待っています…" : "考えています…")}
           </p>
         )}
         <div ref={bottomRef} />
@@ -131,6 +134,20 @@ function ChatItemView({ item, workspace }: { item: ChatItem; workspace: string |
             </pre>
           )}
         </details>
+      );
+    }
+    case "approval": {
+      const state =
+        item.approved === null
+          ? { label: "承認待ち", style: "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100" }
+          : item.approved
+            ? { label: "承認済み", style: "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100" }
+            : { label: "拒否", style: "border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300" };
+      return (
+        <div className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs ${state.style}`}>
+          <span className="font-semibold whitespace-nowrap">{state.label}</span>
+          <span className="truncate">{item.title}</span>
+        </div>
       );
     }
     case "result":

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAllowedOrigin } from "./ws.js";
+import { isAllowedOrigin, parseClientMessage } from "./ws.js";
 
 describe("isAllowedOrigin", () => {
   it("accepts local origins and non-browser clients", () => {
@@ -12,5 +12,19 @@ describe("isAllowedOrigin", () => {
     expect(isAllowedOrigin("https://evil.example")).toBe(false);
     expect(isAllowedOrigin("http://127.0.0.1.evil.example")).toBe(false);
     expect(isAllowedOrigin("null")).toBe(false);
+  });
+});
+
+describe("parseClientMessage", () => {
+  it("accepts known messages and drops malformed ones", () => {
+    expect(parseClientMessage('{"type":"approval_response","id":"a","approved":false,"message":"だめ"}')).toEqual({
+      type: "approval_response",
+      id: "a",
+      approved: false,
+      message: "だめ",
+    });
+    expect(parseClientMessage('{"type":"approval_response","id":"a","approved":"yes"}')).toBeNull();
+    expect(parseClientMessage('{"type":"user_message","text":"  "}')).toBeNull();
+    expect(parseClientMessage("not json")).toBeNull();
   });
 });

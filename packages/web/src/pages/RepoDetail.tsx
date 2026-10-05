@@ -218,7 +218,16 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
               {startSession.isPending && <Spinner />} エージェントと相談する
             </Button>
             {state !== "open" && <p className="text-xs text-slate-500">未対応の Alert を選んでください。</p>}
-            {startSession.error && <Notice tone="error">{startSession.error.message}</Notice>}
+            {startSession.error && (
+              <Notice tone="error">
+                {startSession.error.message}
+                {startSession.error instanceof ApiError && typeof startSession.error.body.sessionId === "string" && (
+                  <a href={sessionHref(owner, repo, startSession.error.body.sessionId)} className="mt-1 block font-medium underline">
+                    進行中のセッションを開く
+                  </a>
+                )}
+              </Notice>
+            )}
           </Card>
         </div>
       )}

@@ -51,5 +51,9 @@ export function useAgentSession(id: string, enabled: boolean) {
     connected,
     send: useCallback((text: string) => post({ type: "user_message", text }), [post]),
     interrupt: useCallback(() => post({ type: "interrupt" }), [post]),
+    respondApproval: useCallback(
+      (id: string, approved: boolean, message?: string) => post({ type: "approval_response", id, approved, message }),
+      [post],
+    ),
   };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chatReducer, describeTool, initialChatState, type ChatAction } from "./chat";
+import { chatReducer, describeTool, initialChatState, pendingApprovals, type ChatAction } from "./chat";
 
 const run = (actions: ChatAction[]) => actions.reduce(chatReducer, initialChatState);
 
@@ -31,6 +31,15 @@ describe("chatReducer", () => {
     expect(state.statusDetail).toBeNull();
     expect(state.costUsd).toBe(0.3);
     expect(chatReducer(state, { type: "reset" })).toEqual(initialChatState);
+  });
+});
+
+describe("approvals", () => {
+  it("tracks pending approvals until they are resolved", () => {
+    const request = (id: string): ChatAction => ({ type: "approval_request", id, toolName: "Bash", title: "t", reason: "r", input: {}, preview: null });
+    const state = run([request("a"), request("b"), { type: "approval_resolved", id: "a", approved: true }]);
+    expect(pendingApprovals(state).map((a) => a.id)).toEqual(["b"]);
+    expect(state.items[0]).toMatchObject({ kind: "approval", id: "a", approved: true });
   });
 });
 

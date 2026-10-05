@@ -17,13 +17,17 @@ export function isAllowedOrigin(origin: string | undefined): boolean {
   }
 }
 
-function parseClientMessage(data: string): ClientMessage | null {
+export function parseClientMessage(data: string): ClientMessage | null {
   try {
     const message = JSON.parse(data) as Partial<ClientMessage>;
     if (message.type === "user_message" && typeof message.text === "string" && message.text.trim()) {
       return { type: "user_message", text: message.text };
     }
     if (message.type === "interrupt") return { type: "interrupt" };
+    if (message.type === "approval_response" && typeof message.id === "string" && typeof message.approved === "boolean") {
+      const text = typeof message.message === "string" ? message.message : undefined;
+      return { type: "approval_response", id: message.id, approved: message.approved, message: text };
+    }
   } catch {
     // 下で null を返す
   }
@@ -47,6 +51,7 @@ export function attachSessionSocket(server: Server, sessions: SessionManager): v
         const message = parseClientMessage(data.toString());
         if (message?.type === "user_message") session.send(message.text);
         else if (message?.type === "interrupt") void session.interrupt();
+        else if (message?.type === "approval_response") session.respondApproval(message.id, message.approved, message.message);
       });
       ws.on("close", unsubscribe);
     });

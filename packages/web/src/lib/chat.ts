@@ -10,6 +10,17 @@ export type ChatItem =
       input: unknown;
       result: { isError: boolean; content: string } | null;
     }
+  | {
+      kind: "approval";
+      id: string;
+      toolName: string;
+      title: string;
+      reason: string;
+      input: unknown;
+      preview: string | null;
+      /** null のあいだは回答待ち */
+      approved: boolean | null;
+    }
   | { kind: "result"; isError: boolean; costUsd: number; durationMs: number; numTurns: number }
   | { kind: "error"; message: string };
 
@@ -25,6 +36,11 @@ export const initialChatState: ChatState = { items: [], status: null, statusDeta
 
 /** 再接続時はサーバーが履歴を最初から送り直すため、いったん空に戻す */
 export type ChatAction = ServerEvent | { type: "reset" };
+
+/** 回答待ちの承認依頼（古い順） */
+export function pendingApprovals(state: ChatState) {
+  return state.items.filter((item): item is Extract<ChatItem, { kind: "approval" }> => item.kind === "approval" && item.approved === null);
+}
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
@@ -55,6 +71,17 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             : item,
         ),
       };
+    case "approval_request": {
+      const { type: _, ...rest } = action;
+      return { ...state, items: [...state.items, { kind: "approval", ...rest, approved: null }] };
+    }
+    case "approval_resolved":
+      return {
+        ...state,
+        items: state.items.map((item) =>
+          item.kind === "approval" && item.id === action.id ? { ...item, approved: action.approved } : item,
+        ),
+      };
     case "result": {
       const { type: _, ...rest } = action;
       return { ...state, costUsd: action.costUsd, items: [...state.items, { kind: "result", ...rest }] };
@@ -76,6 +103,16 @@ export function describeTool(name: string, input: unknown, workspace?: string): 
       return { label: "検索", detail: [str("pattern"), str("glob") || rel(str("path"))].filter(Boolean).join("  ") };
     case "Glob":
       return { label: "ファイルを探す", detail: str("pattern") };
+    case "Edit":
+      return { label: "ファイルを編集", detail: rel(str("file_path")) };
+    case "Write":
+      return { label: "ファイルを作成", detail: rel(str("file_path")) };
+    case "Bash":
+      return { label: "コマンドを実行", detail: str("command") };
+    case "mcp__alertcure__create_pull_request":
+      return { label: "Pull Request を作成", detail: str("title") };
+    case "mcp__alertcure__dismiss_alert":
+      return { label: "Alert を dismiss", detail: args.number ? `#${String(args.number)} ${str("reason")}` : "" };
     case "mcp__alertcure__get_alerts":
       return { label: "Alert の一覧を取得", detail: "" };
     case "mcp__alertcure__get_alert_detail":

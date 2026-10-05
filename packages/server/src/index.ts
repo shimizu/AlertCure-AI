@@ -11,8 +11,16 @@ const HOST = "127.0.0.1";
 const port = Number(process.env.PORT ?? 8787);
 
 const github = createGitHubService();
-const sessions = new SessionManager({ github, workspaces: new WorkspaceManager() });
-const app = createApp({ github, cache: new Cache(), sessions });
+const cache = new Cache();
+const sessions = new SessionManager({
+  github,
+  workspaces: new WorkspaceManager(),
+  // dismiss した Alert が一覧に残らないよう、そのリポジトリの Alert のキャッシュを捨てる
+  onAlertsChanged: (owner, repo) => {
+    for (const state of ["open", "dismissed"]) cache.delete(`alerts:${owner}/${repo}:${state}`);
+  },
+});
+const app = createApp({ github, cache, sessions });
 
 const server = serve({ fetch: app.fetch, hostname: HOST, port }, (info) => {
   console.log(`AlertCure server listening on http://${HOST}:${info.port}`);

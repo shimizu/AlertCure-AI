@@ -10,10 +10,12 @@ const execFileAsync = promisify(execFile);
 
 export const DEFAULT_WORKSPACES_DIR = join(homedir(), ".alertcure", "workspaces");
 
-export type GitRunner = (args: string[], options: { cwd?: string; env: NodeJS.ProcessEnv }) => Promise<void>;
+/** git を実行して標準出力を返す */
+export type GitRunner = (args: string[], options: { cwd?: string; env: NodeJS.ProcessEnv }) => Promise<string>;
 
 const runGit: GitRunner = async (args, { cwd, env }) => {
-  await execFileAsync("git", args, { cwd, env, maxBuffer: 16 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("git", args, { cwd, env, maxBuffer: 16 * 1024 * 1024 });
+  return stdout;
 };
 
 /** 名前に使えない文字を含むリポジトリ名でディレクトリの外へ出ないようにする */
@@ -39,6 +41,13 @@ export function gitAuthEnv(token: string, base: NodeJS.ProcessEnv = process.env)
   };
 }
 
+export interface PreparedWorkspace {
+  dir: string;
+  branch: string;
+  /** 作業ブランチの起点になった既定ブランチのコミット */
+  baseSha: string;
+}
+
 export interface WorkspaceManagerOptions {
   root?: string;
   git?: GitRunner;
@@ -62,19 +71,35 @@ export class WorkspaceManager {
   }
 
   /**
-   * 初回は既定ブランチを浅く clone し、2回目以降は既定ブランチの最新に揃える。
-   * 作業ディレクトリのパスを返す。
+   * 既定ブランチの最新から作業ブランチを作り直す。初回は浅く clone する。
+   * 前回のセッションで残った変更や追跡されていないファイルは捨てる（node_modules など ignore 対象は残す）。
    */
-  async prepare(owner: string, repo: string): Promise<string> {
+  async prepare(owner: string, repo: string, branch: string): Promise<PreparedWorkspace> {
     const dir = this.pathFor(owner, repo);
     const env = gitAuthEnv(await this.getToken());
+    // clone 直後は HEAD が、既存の clone では fetch した FETCH_HEAD が既定ブランチの最新を指す
+    let start = "FETCH_HEAD";
     if (existsSync(join(dir, ".git"))) {
       await this.git(["fetch", "--depth", "1", "origin", "HEAD"], { cwd: dir, env });
-      await this.git(["reset", "--hard", "FETCH_HEAD"], { cwd: dir, env });
     } else {
       await mkdir(dirname(dir), { recursive: true });
       await this.git(["clone", "--depth", "1", `https://github.com/${owner}/${repo}.git`, dir], { env });
+      start = "HEAD";
     }
-    return dir;
+    await this.git(["checkout", "--force", "-B", branch, start], { cwd: dir, env });
+    await this.git(["clean", "-fd"], { cwd: dir, env });
+    const baseSha = (await this.git(["rev-parse", "HEAD"], { cwd: dir, env })).trim();
+    return { dir, branch, baseSha };
+  }
+
+  /** 認証の要らない git コマンドを実行する（差分の確認など） */
+  async run(dir: string, args: string[]): Promise<string> {
+    return this.git(args, { cwd: dir, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+  }
+
+  /** 作業ブランチを push する。強制 push は行わない */
+  async push(dir: string, branch: string): Promise<void> {
+    const env = gitAuthEnv(await this.getToken());
+    await this.git(["push", "origin", `HEAD:refs/heads/${branch}`], { cwd: dir, env });
   }
 }

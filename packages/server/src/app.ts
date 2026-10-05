@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { SessionManager } from "./agent/session.js";
+import { SessionConflictError, type SessionManager } from "./agent/session.js";
 import { cached, type Cache } from "./db/cache.js";
 import { AlertsDisabledError } from "./github/alerts.js";
 import { GitHubAuthError } from "./github/client.js";
@@ -77,7 +77,17 @@ export function createApp({ github, cache, sessions }: AppDeps) {
     return c.json(session.info());
   });
 
+  app.delete("/sessions/:id", (c) => {
+    const session = sessions.get(c.req.param("id"));
+    if (!session) return c.json({ error: "セッションが見つかりません。" }, 404);
+    session.close();
+    return c.json(session.info());
+  });
+
   app.onError((error, c) => {
+    if (error instanceof SessionConflictError) {
+      return c.json({ error: error.message, code: "session_conflict", sessionId: error.sessionId }, 409);
+    }
     if (error instanceof GitHubAuthError) {
       return c.json({ error: error.message, code: "github_auth" }, 401);
     }

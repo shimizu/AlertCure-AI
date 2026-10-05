@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SessionManager } from "./agent/session.js";
+import { SessionConflictError, type SessionManager } from "./agent/session.js";
 import { createApp } from "./app.js";
 import { Cache } from "./db/cache.js";
 import { AlertsDisabledError } from "./github/alerts.js";
@@ -31,7 +31,7 @@ describe("API", () => {
   beforeEach(() => {
     cache = new Cache(":memory:");
     github = { listRepos: vi.fn(async () => [repo]), listAlerts: vi.fn(async () => []) };
-    const info = { id: "s1", owner: "octo", repo: "app", alertNumbers: [1], status: "preparing", workspace: null, createdAt: "" };
+    const info = { id: "s1", owner: "octo", repo: "app", alertNumbers: [1], status: "preparing", workspace: null, branch: "alertcure/fix-1", createdAt: "" };
     sessions = { create: vi.fn(() => ({ info: () => info })), get: vi.fn(() => undefined) };
     app = createApp({
       github: github as unknown as GitHubService,
@@ -124,5 +124,25 @@ describe("API", () => {
 
   it("GET /api/sessions/:id returns 404 for unknown sessions", async () => {
     expect((await app.request("/api/sessions/nope")).status).toBe(404);
+  });
+
+  it("POST /api/sessions returns 409 with the running session id on conflict", async () => {
+    sessions.create.mockImplementationOnce(() => {
+      throw new SessionConflictError("running-1");
+    });
+    const res = await app.request("/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner: "octo", repo: "app", alertNumbers: [1] }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "session_conflict", sessionId: "running-1" });
+  });
+
+  it("DELETE /api/sessions/:id closes the session", async () => {
+    const close = vi.fn();
+    sessions.get.mockReturnValueOnce({ close, info: () => ({ id: "s1" }) });
+    expect((await app.request("/api/sessions/s1", { method: "DELETE" })).status).toBe(200);
+    expect(close).toHaveBeenCalled();
   });
 });

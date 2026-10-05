@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { query, type Options, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type HookCallback,
+  type Options,
+  type PermissionResult,
+  type SDKMessage,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { GitHubService } from "../github/service.js";
+import type { PreparedWorkspace, WorkspaceManager } from "../workspace/manager.js";
 import type { ServerEvent, SessionInfo, SessionStatus } from "./events.js";
 import { decideToolUse } from "./permissions.js";
-import { buildInitialPrompt, SYSTEM_PROMPT_APPEND } from "./prompt.js";
+import { buildInitialPrompt, buildSystemPromptAppend } from "./prompt.js";
 import { createAlertTools } from "./tools.js";
 
 export const DEFAULT_MODEL = "claude-opus-5-5";
@@ -15,9 +23,29 @@ export type QueryFn = (params: { prompt: AsyncIterable<SDKUserMessage>; options:
 
 export interface AgentSessionDeps {
   github: GitHubService;
-  workspaces: { prepare(owner: string, repo: string): Promise<string> };
+  workspaces: Pick<WorkspaceManager, "prepare" | "run" | "push">;
   runQuery?: QueryFn;
   model?: string;
+  /** Alert を dismiss したあとに呼ぶ（キャッシュの破棄など） */
+  onAlertsChanged?: (owner: string, repo: string) => void;
+}
+
+export function branchName(alertNumbers: number[]): string {
+  return `alertcure/fix-${[...alertNumbers].sort((a, b) => a - b).join("-")}`;
+}
+
+/** 承認ダイアログの見出し */
+export function approvalTitle(toolName: string, input: Record<string, unknown>): string {
+  switch (toolName) {
+    case "Bash":
+      return `コマンドを実行: ${String(input.command ?? "")}`;
+    case "mcp__alertcure__create_pull_request":
+      return `Pull Request を作成: ${String(input.title ?? "")}`;
+    case "mcp__alertcure__dismiss_alert":
+      return `Alert #${String(input.number ?? "?")} を dismiss（理由: ${String(input.reason ?? "")}）`;
+    default:
+      return toolName;
+  }
 }
 
 /** ユーザーの発言を SDK に渡すための非同期キュー（ストリーミング入力モード） */
@@ -122,15 +150,17 @@ export function translate(message: SDKMessage): ServerEvent[] {
 export class AgentSession {
   readonly id = randomUUID();
   readonly createdAt = new Date().toISOString();
+  readonly branch: string;
   /** SDK のセッション ID（ステップ6で resume に使う） */
   sdkSessionId: string | null = null;
-  workspace: string | null = null;
+  workspace: PreparedWorkspace | null = null;
 
   private currentStatus: SessionStatus = "preparing";
   private readonly history: ServerEvent[] = [];
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly input = new InputQueue();
   private readonly abort = new AbortController();
+  private readonly approvals = new Map<string, (answer: { approved: boolean; message?: string }) => void>();
   private running: ReturnType<QueryFn> | null = null;
 
   constructor(
@@ -138,15 +168,21 @@ export class AgentSession {
     readonly repo: string,
     readonly alertNumbers: number[],
     private readonly deps: AgentSessionDeps,
-  ) {}
+  ) {
+    this.branch = branchName(alertNumbers);
+  }
 
   get status(): SessionStatus {
     return this.currentStatus;
   }
 
+  get active(): boolean {
+    return this.status !== "closed" && this.status !== "error";
+  }
+
   info(): SessionInfo {
-    const { id, owner, repo, alertNumbers, status, workspace, createdAt } = this;
-    return { id, owner, repo, alertNumbers, status, workspace, createdAt };
+    const { id, owner, repo, alertNumbers, status, branch, createdAt } = this;
+    return { id, owner, repo, alertNumbers, status, workspace: this.workspace?.dir ?? null, branch, createdAt };
   }
 
   /** 履歴を流してから、以降のイベントを購読する */
@@ -161,14 +197,31 @@ export class AgentSession {
     try {
       this.emit({ type: "status", status: "preparing", detail: "リポジトリを準備しています" });
       const { github, workspaces } = this.deps;
-      const [cwd, openAlerts] = await Promise.all([
-        workspaces.prepare(this.owner, this.repo),
+      const [workspace, defaultBranch, openAlerts] = await Promise.all([
+        workspaces.prepare(this.owner, this.repo, this.branch),
+        github.getDefaultBranch(this.owner, this.repo),
         github.listAlerts(this.owner, this.repo, "open"),
       ]);
       const alerts = openAlerts.filter((a) => this.alertNumbers.includes(a.number));
       if (alerts.length === 0) throw new Error("選択された Alert が見つかりません（すでに対応済みの可能性があります）。");
       if (this.abort.signal.aborted) return;
-      this.workspace = cwd;
+      this.workspace = workspace;
+      const cwd = workspace.dir;
+
+      // 自動で許可されるツールも含め、すべての呼び出しを同じ規則で判定する。
+      // 承認が必要なもの（ask）は SDK が canUseTool を呼ぶので、そこでユーザーに確認する
+      const preToolUse: HookCallback = async (hookInput) => {
+        if (hookInput.hook_event_name !== "PreToolUse") return {};
+        const decision = decideToolUse(cwd, hookInput.tool_name, (hookInput.tool_input ?? {}) as Record<string, unknown>);
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: decision.behavior,
+            permissionDecisionReason:
+              decision.behavior === "deny" ? decision.message : decision.behavior === "ask" ? decision.reason : undefined,
+          },
+        };
+      };
 
       const runQuery = this.deps.runQuery ?? (query as QueryFn);
       this.running = runQuery({
@@ -177,14 +230,30 @@ export class AgentSession {
           cwd,
           model: this.deps.model ?? process.env.ALERTCURE_MODEL ?? DEFAULT_MODEL,
           effort: "high",
-          systemPrompt: { type: "preset", preset: "claude_code", append: SYSTEM_PROMPT_APPEND },
-          tools: ["Read", "Grep", "Glob"],
-          mcpServers: { alertcure: createAlertTools(github, this.owner, this.repo) },
+          systemPrompt: { type: "preset", preset: "claude_code", append: buildSystemPromptAppend(this.branch, defaultBranch) },
+          tools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+          mcpServers: {
+            alertcure: createAlertTools({
+              github,
+              workspaces,
+              owner: this.owner,
+              repo: this.repo,
+              alertNumbers: this.alertNumbers,
+              workspace,
+              defaultBranch,
+              onAlertsChanged: () => this.deps.onAlertsChanged?.(this.owner, this.repo),
+            }),
+          },
           // ユーザーの ~/.claude などの設定は読み込まない
           settingSources: [],
           includePartialMessages: true,
           abortController: this.abort,
-          canUseTool: async (toolName, input) => decideToolUse(cwd, toolName, input),
+          hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
+          canUseTool: async (toolName, toolInput, { signal }) => {
+            const decision = decideToolUse(cwd, toolName, toolInput);
+            if (decision.behavior === "ask") return this.requestApproval(toolName, toolInput, decision.reason, signal);
+            return decision;
+          },
         },
       });
       this.send(buildInitialPrompt(this.owner, this.repo, alerts));
@@ -206,7 +275,7 @@ export class AgentSession {
   }
 
   send(text: string): void {
-    if (this.status === "closed" || this.status === "error") return;
+    if (!this.active) return;
     this.emit({ type: "user_message", text });
     this.input.push(text);
     this.setStatus("running");
@@ -216,10 +285,57 @@ export class AgentSession {
     if (this.status === "running") await this.running?.interrupt();
   }
 
+  /** 承認ダイアログへの回答を受け取る */
+  respondApproval(id: string, approved: boolean, message?: string): void {
+    this.approvals.get(id)?.({ approved, message });
+  }
+
   close(): void {
+    for (const resolve of this.approvals.values()) resolve({ approved: false, message: "セッションが終了しました。" });
     this.input.close();
     this.abort.abort();
     this.setStatus("closed");
+  }
+
+  private async requestApproval(
+    toolName: string,
+    input: Record<string, unknown>,
+    reason: string,
+    signal: AbortSignal,
+  ): Promise<PermissionResult> {
+    const id = randomUUID();
+    const preview = await this.approvalPreview(toolName).catch(() => null);
+    const answer = await new Promise<{ approved: boolean; message?: string }>((resolve) => {
+      this.approvals.set(id, resolve);
+      signal.addEventListener("abort", () => resolve({ approved: false, message: "中断されました。" }), { once: true });
+      this.emit({ type: "approval_request", id, toolName, title: approvalTitle(toolName, input), reason, input, preview });
+    });
+    // 中断と回答が重なっても、解決の通知は一度だけ送る
+    if (!this.approvals.delete(id)) return { behavior: "deny", message: "中断されました。" };
+    this.emit({ type: "approval_resolved", id, approved: answer.approved });
+    if (answer.approved) return { behavior: "allow", updatedInput: input };
+    const message = answer.message?.trim();
+    return { behavior: "deny", message: message ? `ユーザーが拒否しました。理由: ${message}` : "ユーザーが拒否しました。" };
+  }
+
+  /** PR の作成前に、コミットと変更の概要を見せる */
+  private async approvalPreview(toolName: string): Promise<string | null> {
+    if (toolName !== "mcp__alertcure__create_pull_request" || !this.workspace) return null;
+    const { dir, baseSha } = this.workspace;
+    const run = (args: string[]) => this.deps.workspaces.run(dir, args);
+    const [log, stat, status] = await Promise.all([
+      run(["log", "--oneline", `${baseSha}..HEAD`]),
+      run(["diff", "--stat", baseSha, "HEAD"]),
+      run(["status", "--short"]),
+    ]);
+    return [
+      `ブランチ: ${this.branch}`,
+      `コミット:\n${log.trim() || "（なし）"}`,
+      `変更されたファイル:\n${stat.trim() || "（なし）"}`,
+      status.trim() ? `コミットされていない変更:\n${status.trim()}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   private setStatus(status: SessionStatus): void {
@@ -240,6 +356,14 @@ export class AgentSession {
   }
 }
 
+/** 同じリポジトリで進行中のセッションがあるときのエラー（作業ディレクトリを共有するため） */
+export class SessionConflictError extends Error {
+  constructor(readonly sessionId: string) {
+    super("このリポジトリでは別のセッションが進行中です。終了してから新しく始めてください。");
+    this.name = "SessionConflictError";
+  }
+}
+
 /** 実行中のセッションをメモリ上で管理する */
 export class SessionManager {
   private readonly sessions = new Map<string, AgentSession>();
@@ -247,6 +371,8 @@ export class SessionManager {
   constructor(private readonly deps: AgentSessionDeps) {}
 
   create(owner: string, repo: string, alertNumbers: number[]): AgentSession {
+    const existing = [...this.sessions.values()].find((s) => s.active && s.owner === owner && s.repo === repo);
+    if (existing) throw new SessionConflictError(existing.id);
     const session = new AgentSession(owner, repo, alertNumbers, this.deps);
     this.sessions.set(session.id, session);
     void session.start();

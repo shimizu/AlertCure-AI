@@ -9,10 +9,16 @@ export type ServerEvent =
   | { type: "assistant_delta"; text: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; toolUseId: string; isError: boolean; content: string }
+  /** ユーザーの承認待ち。approval_resolved が来るまで有効 */
+  | { type: "approval_request"; id: string; toolName: string; title: string; reason: string; input: unknown; preview: string | null }
+  | { type: "approval_resolved"; id: string; approved: boolean }
   | { type: "result"; isError: boolean; costUsd: number; durationMs: number; numTurns: number }
   | { type: "error"; message: string };
 
-export type ClientMessage = { type: "user_message"; text: string } | { type: "interrupt" };
+export type ClientMessage =
+  | { type: "user_message"; text: string }
+  | { type: "interrupt" }
+  | { type: "approval_response"; id: string; approved: boolean; message?: string };
 
 export interface SessionInfo {
   id: string;
@@ -22,5 +28,7 @@ export interface SessionInfo {
   status: SessionStatus;
   /** 作業ディレクトリ（準備が終わるまでは null） */
   workspace: string | null;
+  /** 作業ブランチ（alertcure/fix-<番号>） */
+  branch: string;
   createdAt: string;
 }

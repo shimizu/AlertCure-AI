@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { GitHubService } from "../github/service.js";
 import type { DependabotAlert } from "../types.js";
 import type { ServerEvent } from "./events.js";
-import { AgentSession, translate, type QueryFn } from "./session.js";
+import { AgentSession, branchName, SessionConflictError, SessionManager, translate, type QueryFn } from "./session.js";
 
 const alert: DependabotAlert = {
   number: 7,
@@ -70,8 +70,16 @@ function fakeQuery(replies: SDKMessage[][]) {
 
 function setup(replies: SDKMessage[][], alerts: DependabotAlert[] = [alert]) {
   const fake = fakeQuery(replies);
-  const github = { listRepos: vi.fn(), listAlerts: vi.fn(async () => alerts) } as unknown as GitHubService;
-  const workspaces = { prepare: vi.fn(async () => "/ws/octo/app") };
+  const github = {
+    listRepos: vi.fn(),
+    listAlerts: vi.fn(async () => alerts),
+    getDefaultBranch: vi.fn(async () => "main"),
+  } as unknown as GitHubService;
+  const workspaces = {
+    prepare: vi.fn(async (_o: string, _r: string, branch: string) => ({ dir: "/ws/octo/app", branch, baseSha: "base" })),
+    run: vi.fn(async (_dir: string, args: string[]) => (args[0] === "log" ? "abc fix: nanoid\n" : "")),
+    push: vi.fn(async () => {}),
+  };
   const session = new AgentSession("octo", "app", [7], { github, workspaces, runQuery: fake.runQuery, model: "test-model" });
   const events: ServerEvent[] = [];
   session.subscribe((e) => events.push(e));
@@ -85,7 +93,8 @@ describe("AgentSession", () => {
     await vi.waitFor(() => expect(session.status).toBe("idle"));
 
     expect(prompts[0]).toContain("#7 [high] npm:lodash");
-    expect(getOptions()).toMatchObject({ cwd: "/ws/octo/app", model: "test-model", tools: ["Read", "Grep", "Glob"] });
+    expect(getOptions()).toMatchObject({ cwd: "/ws/octo/app", model: "test-model" });
+    expect(session.info()).toMatchObject({ branch: "alertcure/fix-7", workspace: "/ws/octo/app" });
     expect(session.sdkSessionId).toBe("sdk-1");
     expect(events.map((e) => e.type)).toEqual([
       "status", // preparing
@@ -117,14 +126,38 @@ describe("AgentSession", () => {
     session.close();
   });
 
-  it("checks permissions against the workspace", async () => {
-    const { session, getOptions } = setup([[result]]);
+  it("allows safe tools, denies forbidden ones and asks the user for the rest", async () => {
+    const { session, events, getOptions } = setup([[result]]);
     void session.start();
     await vi.waitFor(() => expect(getOptions()).toBeDefined());
     const canUseTool = getOptions()!.canUseTool!;
-    const signal = new AbortController().signal;
-    expect((await canUseTool("Read", { file_path: "/ws/octo/app/a.ts" }, { signal, toolUseID: "1" } as never)).behavior).toBe("allow");
-    expect((await canUseTool("Bash", { command: "rm -rf /" }, { signal, toolUseID: "2" } as never)).behavior).toBe("deny");
+    const opts = (signal = new AbortController().signal) => ({ signal, toolUseID: "1" }) as never;
+
+    expect((await canUseTool("Edit", { file_path: "/ws/octo/app/package.json" }, opts())).behavior).toBe("allow");
+    expect((await canUseTool("Bash", { command: "git push --force" }, opts())).behavior).toBe("deny");
+
+    // 承認する
+    const approved = canUseTool("mcp__alertcure__create_pull_request", { title: "fix" }, opts());
+    await vi.waitFor(() => expect(events.some((e) => e.type === "approval_request")).toBe(true));
+    const request = events.find((e) => e.type === "approval_request")!;
+    expect(request).toMatchObject({ title: "Pull Request を作成: fix", preview: expect.stringContaining("abc fix: nanoid") });
+    session.respondApproval((request as { id: string }).id, true);
+    expect(await approved).toMatchObject({ behavior: "allow", updatedInput: { title: "fix" } });
+    expect(events).toContainEqual({ type: "approval_resolved", id: (request as { id: string }).id, approved: true });
+
+    // 理由を付けて拒否する
+    const denied = canUseTool("Bash", { command: "curl example.com" }, opts());
+    await vi.waitFor(() => expect(events.filter((e) => e.type === "approval_request")).toHaveLength(2));
+    const second = events.filter((e) => e.type === "approval_request")[1] as { id: string };
+    session.respondApproval(second.id, false, "外部への通信はしない");
+    expect(await denied).toEqual({ behavior: "deny", message: "ユーザーが拒否しました。理由: 外部への通信はしない" });
+
+    // 中断されたら拒否として扱う
+    const controller = new AbortController();
+    const aborted = canUseTool("Bash", { command: "curl example.com" }, opts(controller.signal));
+    await vi.waitFor(() => expect(events.filter((e) => e.type === "approval_request")).toHaveLength(3));
+    controller.abort();
+    expect((await aborted).behavior).toBe("deny");
     session.close();
   });
 
@@ -133,5 +166,23 @@ describe("AgentSession", () => {
     await session.start();
     expect(session.status).toBe("error");
     expect(events).toContainEqual({ type: "error", message: expect.stringContaining("見つかりません") });
+  });
+});
+
+describe("SessionManager", () => {
+  it("refuses a second active session for the same repository", () => {
+    const github = { listAlerts: vi.fn(() => new Promise(() => {})), getDefaultBranch: vi.fn(async () => "main") } as unknown as GitHubService;
+    const workspaces = { prepare: vi.fn(() => new Promise<never>(() => {})), run: vi.fn(), push: vi.fn() };
+    const manager = new SessionManager({ github, workspaces });
+    const first = manager.create("octo", "app", [1]);
+    expect(() => manager.create("octo", "app", [2])).toThrow(SessionConflictError);
+    expect(manager.create("octo", "other", [1])).toBeDefined();
+    first.close();
+    expect(manager.create("octo", "app", [2])).toBeDefined();
+    manager.closeAll();
+  });
+
+  it("names branches by sorted alert numbers", () => {
+    expect(branchName([5, 2])).toBe("alertcure/fix-2-5");
   });
 });
