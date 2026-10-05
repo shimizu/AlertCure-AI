@@ -49,6 +49,8 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ owner, repo, alertNumbers }),
     }),
+  listSessions: (owner: string, repo: string) =>
+    request<{ sessions: SessionInfo[] }>(`/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/sessions`),
   getSession: (id: string) => request<SessionInfo>(`/api/sessions/${encodeURIComponent(id)}`),
   closeSession: (id: string) => request<SessionInfo>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

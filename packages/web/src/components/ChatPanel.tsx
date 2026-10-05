@@ -8,6 +8,7 @@ const STATUS_LABEL = {
   preparing: "準備中",
   running: "応答中",
   idle: "入力待ち",
+  suspended: "再開待ち",
   error: "エラー",
   closed: "終了",
 } as const;
@@ -39,7 +40,8 @@ export function ChatPanel({
   const [draft, setDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const { status } = state;
-  const canSend = connected && status === "idle" && draft.trim().length > 0;
+  const canInput = status === "idle" || status === "suspended";
+  const canSend = connected && canInput && draft.trim().length > 0;
   const waitingApproval = pendingApprovals(state).length > 0;
 
   useEffect(() => {
@@ -70,6 +72,9 @@ export function ChatPanel({
               (status === "preparing" ? "準備しています…" : waitingApproval ? "承認を待っています…" : "考えています…")}
           </p>
         )}
+        {status === "suspended" && state.statusDetail && (
+          <p className="text-center text-xs text-slate-500 dark:text-slate-400">{state.statusDetail}</p>
+        )}
         <div ref={bottomRef} />
       </div>
 
@@ -79,7 +84,7 @@ export function ChatPanel({
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={onKeyDown}
           rows={3}
-          placeholder={status === "idle" ? "返信を入力（Enter で送信、Shift+Enter で改行）" : "応答が終わると入力できます"}
+          placeholder={canInput ? "返信を入力（Enter で送信、Shift+Enter で改行）" : "応答が終わると入力できます"}
           disabled={!connected || status === "error" || status === "closed"}
           className="w-full resize-none rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-800"
         />

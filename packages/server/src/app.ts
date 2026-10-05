@@ -71,6 +71,11 @@ export function createApp({ github, cache, sessions }: AppDeps) {
     return c.json(session.info(), 201);
   });
 
+  app.get("/repos/:owner/:repo/sessions", (c) => {
+    const { owner, repo } = c.req.param();
+    return c.json({ sessions: sessions.list(owner, repo).map((s) => s.info()) });
+  });
+
   app.get("/sessions/:id", (c) => {
     const session = sessions.get(c.req.param("id"));
     if (!session) return c.json({ error: "セッションが見つかりません。サーバーを再起動した場合は、もう一度開始してください。" }, 404);

@@ -6,7 +6,7 @@ import { api, ApiError } from "../lib/api";
 import { countBySeverity, countPackages, filterAlerts, sortAlerts } from "../lib/alertTable";
 import { formatDate, formatRelative, numberFormat } from "../lib/format";
 import { sessionHref } from "../lib/router";
-import { SEVERITY_ORDER, type AlertState, type DependabotAlert, type Severity } from "../lib/types";
+import { SEVERITY_ORDER, type AlertState, type DependabotAlert, type SessionStatus, type Severity } from "../lib/types";
 
 const STATE_TABS: { state: AlertState; label: string }[] = [
   { state: "open", label: "未対応" },
@@ -228,9 +228,40 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
                 )}
               </Notice>
             )}
+            <SessionList owner={owner} repo={repo} />
           </Card>
         </div>
       )}
+    </div>
+  );
+}
+
+const SESSION_STATUS_LABEL: Record<SessionStatus, string> = {
+  preparing: "準備中",
+  running: "応答中",
+  idle: "入力待ち",
+  suspended: "再開待ち",
+  error: "エラー",
+  closed: "終了",
+};
+
+function SessionList({ owner, repo }: { owner: string; repo: string }) {
+  const { data } = useQuery({ queryKey: ["sessions", owner, repo], queryFn: () => api.listSessions(owner, repo) });
+  if (!data?.sessions.length) return null;
+  return (
+    <div className="border-t border-slate-200 pt-3 dark:border-slate-800">
+      <h3 className="mb-1.5 text-xs font-semibold text-slate-500 dark:text-slate-400">これまでのセッション</h3>
+      <ul className="space-y-1 text-sm">
+        {data.sessions.map((s) => (
+          <li key={s.id}>
+            <a href={sessionHref(owner, repo, s.id)} className="flex items-center gap-2 rounded px-1.5 py-1 hover:bg-slate-100 dark:hover:bg-slate-800">
+              <span className="tabular-nums">{s.alertNumbers.map((n) => `#${n}`).join(" ")}</span>
+              <span className="text-xs text-slate-400">{formatRelative(s.createdAt)}</span>
+              <span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{SESSION_STATUS_LABEL[s.status]}</span>
+            </a>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

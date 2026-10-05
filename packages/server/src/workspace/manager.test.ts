@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { gitAuthEnv, WorkspaceManager, type GitRunner } from "./manager.js";
+import { gitAuthEnv, gitErrorMessage, WorkspaceManager, type GitRunner } from "./manager.js";
 
 describe("WorkspaceManager", () => {
   let root: string;
@@ -54,6 +54,13 @@ describe("WorkspaceManager", () => {
     await expect(manager.prepare("..", "app", "b")).rejects.toThrow();
     await expect(manager.prepare("octo", "a/b", "b")).rejects.toThrow();
     expect(git).not.toHaveBeenCalled();
+  });
+
+  it("explains git failures", () => {
+    expect(gitErrorMessage(["push"], { code: 1, stderr: "hint: a\n ! [rejected] non-fast-forward\n" })).toBe(
+      "git push に失敗しました。\nhint: a\n ! [rejected] non-fast-forward",
+    );
+    expect(gitErrorMessage(["clone"], { code: "ENOENT" })).toContain("インストール");
   });
 
   it("disables interactive prompts", () => {

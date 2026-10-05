@@ -1,6 +1,7 @@
 /** WebSocket でやり取りするメッセージの型（web からも型だけ参照する） */
 
-export type SessionStatus = "preparing" | "running" | "idle" | "error" | "closed";
+/** suspended: サーバーの再起動で止まっていて、次のメッセージで再開する */
+export type SessionStatus = "preparing" | "running" | "idle" | "suspended" | "error" | "closed";
 
 export type ServerEvent =
   | { type: "status"; status: SessionStatus; detail?: string }

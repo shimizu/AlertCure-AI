@@ -13,9 +13,20 @@ export const DEFAULT_WORKSPACES_DIR = join(homedir(), ".alertcure", "workspaces"
 /** git を実行して標準出力を返す */
 export type GitRunner = (args: string[], options: { cwd?: string; env: NodeJS.ProcessEnv }) => Promise<string>;
 
+/** git の失敗を、どのコマンドで何が起きたかがわかるメッセージにする */
+export function gitErrorMessage(args: string[], error: { code?: unknown; stderr?: unknown; message?: string }): string {
+  if (error.code === "ENOENT") return "git コマンドが見つかりません。git をインストールしてください。";
+  const stderr = typeof error.stderr === "string" ? error.stderr.trim().split("\n").slice(-3).join("\n") : "";
+  return `git ${args[0]} に失敗しました。${stderr ? `\n${stderr}` : ""}`;
+}
+
 const runGit: GitRunner = async (args, { cwd, env }) => {
-  const { stdout } = await execFileAsync("git", args, { cwd, env, maxBuffer: 16 * 1024 * 1024 });
-  return stdout;
+  try {
+    const { stdout } = await execFileAsync("git", args, { cwd, env, maxBuffer: 16 * 1024 * 1024 });
+    return stdout;
+  } catch (error) {
+    throw new Error(gitErrorMessage(args, error as { code?: unknown; stderr?: unknown }));
+  }
 };
 
 /** 名前に使えない文字を含むリポジトリ名でディレクトリの外へ出ないようにする */

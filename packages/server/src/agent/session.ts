@@ -7,6 +7,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { SessionStore, StoredSession } from "../db/sessions.js";
 import type { GitHubService } from "../github/service.js";
 import type { PreparedWorkspace, WorkspaceManager } from "../workspace/manager.js";
 import type { ServerEvent, SessionInfo, SessionStatus } from "./events.js";
@@ -28,7 +29,11 @@ export interface AgentSessionDeps {
   model?: string;
   /** Alert を dismiss したあとに呼ぶ（キャッシュの破棄など） */
   onAlertsChanged?: (owner: string, repo: string) => void;
+  /** セッションの保存先（サーバーの再起動後に再開するため） */
+  store?: Pick<SessionStore, "save">;
 }
+
+const PERSIST_INTERVAL_MS = 2000;
 
 export function branchName(alertNumbers: number[]): string {
   return `alertcure/fix-${[...alertNumbers].sort((a, b) => a - b).join("-")}`;
@@ -96,6 +101,25 @@ function toolResultText(content: unknown): string {
   return "";
 }
 
+/** Claude API のエラーを、利用者が対処できる言葉に置き換える */
+export function apiErrorMessage(error: string): string {
+  switch (error) {
+    case "authentication_failed":
+      return "Claude API の認証に失敗しました。ANTHROPIC_API_KEY が正しいか確認し、サーバーを再起動してください。";
+    case "billing_error":
+      return "Claude API の請求設定に問題があります。Claude Console でクレジットや支払い方法を確認してください。";
+    case "rate_limit":
+      return "Claude API のレート制限に達しました。しばらく待ってから、もう一度送信してください。";
+    case "overloaded":
+    case "server_error":
+      return "Claude API が混み合っているか、一時的なエラーが起きています。しばらく待ってから、もう一度送信してください。";
+    case "model_not_found":
+      return `モデルが見つかりません。ALERTCURE_MODEL の設定（現在: ${process.env.ALERTCURE_MODEL ?? DEFAULT_MODEL}）を確認してください。`;
+    default:
+      return `Claude API でエラーが発生しました（${error}）。`;
+  }
+}
+
 /** SDK のメッセージを画面に送るイベントに変換する。サブエージェントの出力は扱わない */
 export function translate(message: SDKMessage): ServerEvent[] {
   switch (message.type) {
@@ -106,9 +130,11 @@ export function translate(message: SDKMessage): ServerEvent[] {
     }
     case "assistant": {
       if (message.parent_tool_use_id) return [];
-      return message.message.content.flatMap((block): ServerEvent[] =>
+      const events = message.message.content.flatMap((block): ServerEvent[] =>
         block.type === "tool_use" ? [{ type: "tool_use", id: block.id, name: block.name, input: block.input }] : [],
       );
+      if (message.error) events.push({ type: "error", message: apiErrorMessage(message.error) });
+      return events;
     }
     case "user": {
       const { content } = message.message;
@@ -148,12 +174,13 @@ export function translate(message: SDKMessage): ServerEvent[] {
 
 /** 1 件の Alert 対応セッション。SDK の query() をストリーミング入力モードで動かし、イベントを購読者に流す */
 export class AgentSession {
-  readonly id = randomUUID();
-  readonly createdAt = new Date().toISOString();
+  readonly id: string;
+  readonly createdAt: string;
   readonly branch: string;
-  /** SDK のセッション ID（ステップ6で resume に使う） */
+  /** SDK のセッション ID（resume に使う） */
   sdkSessionId: string | null = null;
   workspace: PreparedWorkspace | null = null;
+  defaultBranch: string | null = null;
 
   private currentStatus: SessionStatus = "preparing";
   private readonly history: ServerEvent[] = [];
@@ -162,20 +189,55 @@ export class AgentSession {
   private readonly abort = new AbortController();
   private readonly approvals = new Map<string, (answer: { approved: boolean; message?: string }) => void>();
   private running: ReturnType<QueryFn> | null = null;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** サーバーの停止中は、状態を変えずに保存も行わない（再起動後に再開できるようにする） */
+  private suspending = false;
 
   constructor(
     readonly owner: string,
     readonly repo: string,
     readonly alertNumbers: number[],
     private readonly deps: AgentSessionDeps,
+    restored?: StoredSession,
   ) {
-    this.branch = branchName(alertNumbers);
+    this.id = restored?.id ?? randomUUID();
+    this.createdAt = restored?.createdAt ?? new Date().toISOString();
+    this.branch = restored?.branch ?? branchName(alertNumbers);
+    if (!restored) return;
+
+    this.sdkSessionId = restored.sdkSessionId;
+    this.workspace = restored.workspace;
+    this.defaultBranch = restored.defaultBranch;
+    this.history.push(...restored.history);
+    if (restored.status === "closed" || restored.status === "error") {
+      this.currentStatus = restored.status;
+      return;
+    }
+    // 停止前に回答待ちだった承認依頼と、実行中だったツールは中断として閉じる
+    const done = new Set(
+      restored.history.flatMap((e) => (e.type === "approval_resolved" ? [e.id] : e.type === "tool_result" ? [e.toolUseId] : [])),
+    );
+    for (const event of restored.history) {
+      if (done.has(event.type === "tool_use" || event.type === "approval_request" ? event.id : "")) continue;
+      if (event.type === "approval_request") this.history.push({ type: "approval_resolved", id: event.id, approved: false });
+      if (event.type === "tool_use") {
+        this.history.push({ type: "tool_result", toolUseId: event.id, isError: true, content: "サーバーの停止で中断されました。" });
+      }
+    }
+    const resumable = this.sdkSessionId && this.workspace && this.defaultBranch;
+    this.history.push(
+      resumable
+        ? { type: "status", status: "suspended", detail: "サーバーが再起動しました。メッセージを送ると会話を再開します" }
+        : { type: "status", status: "error", detail: "会話を再開するための情報がありません" },
+    );
+    this.currentStatus = resumable ? "suspended" : "error";
   }
 
   get status(): SessionStatus {
     return this.currentStatus;
   }
 
+  /** 作業ディレクトリを使っている（または再開できる）状態 */
   get active(): boolean {
     return this.status !== "closed" && this.status !== "error";
   }
@@ -194,7 +256,7 @@ export class AgentSession {
 
   /** 作業ディレクトリを用意して最初の依頼を送る。完了（セッション終了）まで待つ Promise を返す */
   async start(): Promise<void> {
-    try {
+    await this.guard(async () => {
       this.emit({ type: "status", status: "preparing", detail: "リポジトリを準備しています" });
       const { github, workspaces } = this.deps;
       const [workspace, defaultBranch, openAlerts] = await Promise.all([
@@ -204,78 +266,22 @@ export class AgentSession {
       ]);
       const alerts = openAlerts.filter((a) => this.alertNumbers.includes(a.number));
       if (alerts.length === 0) throw new Error("選択された Alert が見つかりません（すでに対応済みの可能性があります）。");
-      if (this.abort.signal.aborted) return;
       this.workspace = workspace;
-      const cwd = workspace.dir;
-
-      // 自動で許可されるツールも含め、すべての呼び出しを同じ規則で判定する。
-      // 承認が必要なもの（ask）は SDK が canUseTool を呼ぶので、そこでユーザーに確認する
-      const preToolUse: HookCallback = async (hookInput) => {
-        if (hookInput.hook_event_name !== "PreToolUse") return {};
-        const decision = decideToolUse(cwd, hookInput.tool_name, (hookInput.tool_input ?? {}) as Record<string, unknown>);
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: decision.behavior,
-            permissionDecisionReason:
-              decision.behavior === "deny" ? decision.message : decision.behavior === "ask" ? decision.reason : undefined,
-          },
-        };
-      };
-
-      const runQuery = this.deps.runQuery ?? (query as QueryFn);
-      this.running = runQuery({
-        prompt: this.input,
-        options: {
-          cwd,
-          model: this.deps.model ?? process.env.ALERTCURE_MODEL ?? DEFAULT_MODEL,
-          effort: "high",
-          systemPrompt: { type: "preset", preset: "claude_code", append: buildSystemPromptAppend(this.branch, defaultBranch) },
-          tools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
-          mcpServers: {
-            alertcure: createAlertTools({
-              github,
-              workspaces,
-              owner: this.owner,
-              repo: this.repo,
-              alertNumbers: this.alertNumbers,
-              workspace,
-              defaultBranch,
-              onAlertsChanged: () => this.deps.onAlertsChanged?.(this.owner, this.repo),
-            }),
-          },
-          // ユーザーの ~/.claude などの設定は読み込まない
-          settingSources: [],
-          includePartialMessages: true,
-          abortController: this.abort,
-          hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
-          canUseTool: async (toolName, toolInput, { signal }) => {
-            const decision = decideToolUse(cwd, toolName, toolInput);
-            if (decision.behavior === "ask") return this.requestApproval(toolName, toolInput, decision.reason, signal);
-            return decision;
-          },
-        },
-      });
-      this.send(buildInitialPrompt(this.owner, this.repo, alerts));
-
-      for await (const message of this.running) {
-        if (message.type === "system" && message.subtype === "init") this.sdkSessionId = message.session_id;
-        for (const event of translate(message)) this.emit(event);
-        if (message.type === "result") this.setStatus("idle");
-      }
-      this.setStatus("closed");
-    } catch (error) {
-      if (this.abort.signal.aborted) {
-        this.setStatus("closed");
-        return;
-      }
-      this.emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
-      this.setStatus("error");
-    }
+      this.defaultBranch = defaultBranch;
+      await this.run(buildInitialPrompt(this.owner, this.repo, alerts));
+    });
   }
 
   send(text: string): void {
-    if (!this.active) return;
+    if (this.status === "suspended") {
+      void this.resume(text);
+      return;
+    }
+    if (!this.active || this.status === "preparing") return;
+    this.deliver(text);
+  }
+
+  private deliver(text: string): void {
     this.emit({ type: "user_message", text });
     this.input.push(text);
     this.setStatus("running");
@@ -295,6 +301,106 @@ export class AgentSession {
     this.input.close();
     this.abort.abort();
     this.setStatus("closed");
+  }
+
+  /** サーバーの停止時に呼ぶ。保存済みの状態はそのまま残し、再起動後に再開できるようにする */
+  suspend(): void {
+    if (this.persistTimer) this.persist();
+    this.suspending = true;
+    this.input.close();
+    this.abort.abort();
+  }
+
+  /** サーバーの再起動後、最初のメッセージで SDK のセッションを resume する */
+  private async resume(text: string): Promise<void> {
+    await this.guard(async () => {
+      this.emit({ type: "status", status: "preparing", detail: "会話を再開しています" });
+      const { dir } = this.workspace!;
+      // 停止中に別の作業でブランチが切り替わっていても、このセッションのブランチに戻す
+      await this.deps.workspaces.run(dir, ["checkout", this.branch]);
+      await this.run(text, this.sdkSessionId!);
+    });
+  }
+
+  /** 失敗をエラー表示に変え、中断や停止による終了はそれぞれの状態にする */
+  private async guard(task: () => Promise<void>): Promise<void> {
+    try {
+      await task();
+    } catch (error) {
+      if (this.suspending) return;
+      if (this.abort.signal.aborted) {
+        this.setStatus("closed");
+        return;
+      }
+      this.emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      this.setStatus("error");
+    }
+  }
+
+  private async run(firstMessage: string, resume?: string): Promise<void> {
+    if (this.abort.signal.aborted) return;
+    const { github, workspaces } = this.deps;
+    const workspace = this.workspace!;
+    const defaultBranch = this.defaultBranch!;
+    const cwd = workspace.dir;
+
+    // 自動で許可されるツールも含め、すべての呼び出しを同じ規則で判定する。
+    // 承認が必要なもの（ask）は SDK が canUseTool を呼ぶので、そこでユーザーに確認する
+    const preToolUse: HookCallback = async (hookInput) => {
+      if (hookInput.hook_event_name !== "PreToolUse") return {};
+      const decision = decideToolUse(cwd, hookInput.tool_name, (hookInput.tool_input ?? {}) as Record<string, unknown>);
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: decision.behavior,
+          permissionDecisionReason:
+            decision.behavior === "deny" ? decision.message : decision.behavior === "ask" ? decision.reason : undefined,
+        },
+      };
+    };
+
+    const runQuery = this.deps.runQuery ?? (query as QueryFn);
+    this.running = runQuery({
+      prompt: this.input,
+      options: {
+        cwd,
+        resume,
+        model: this.deps.model ?? process.env.ALERTCURE_MODEL ?? DEFAULT_MODEL,
+        effort: "high",
+        systemPrompt: { type: "preset", preset: "claude_code", append: buildSystemPromptAppend(this.branch, defaultBranch) },
+        tools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+        mcpServers: {
+          alertcure: createAlertTools({
+            github,
+            workspaces,
+            owner: this.owner,
+            repo: this.repo,
+            alertNumbers: this.alertNumbers,
+            workspace,
+            defaultBranch,
+            onAlertsChanged: () => this.deps.onAlertsChanged?.(this.owner, this.repo),
+          }),
+        },
+        // ユーザーの ~/.claude などの設定は読み込まない
+        settingSources: [],
+        includePartialMessages: true,
+        abortController: this.abort,
+        hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
+        canUseTool: async (toolName, toolInput, { signal }) => {
+          const decision = decideToolUse(cwd, toolName, toolInput);
+          if (decision.behavior === "ask") return this.requestApproval(toolName, toolInput, decision.reason, signal);
+          return decision;
+        },
+      },
+    });
+    this.deliver(firstMessage);
+
+    for await (const message of this.running) {
+      if (message.type === "system" && message.subtype === "init") this.sdkSessionId = message.session_id;
+      for (const event of translate(message)) this.emit(event);
+      if (message.type === "result") this.setStatus("idle");
+    }
+    if (!this.suspending) this.setStatus("closed");
   }
 
   private async requestApproval(
@@ -353,6 +459,35 @@ export class AgentSession {
       this.history.push(event);
     }
     for (const listener of this.listeners) listener(event);
+    this.schedulePersist(event);
+  }
+
+  /** 状態の変化と承認はすぐに、それ以外（文章の断片など）はまとめて保存する */
+  private schedulePersist(event: ServerEvent): void {
+    if (!this.deps.store || this.suspending) return;
+    if (event.type === "status" || event.type === "approval_request" || event.type === "approval_resolved") {
+      this.persist();
+    } else {
+      this.persistTimer ??= setTimeout(() => this.persist(), PERSIST_INTERVAL_MS);
+    }
+  }
+
+  private persist(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = null;
+    this.deps.store?.save({
+      id: this.id,
+      owner: this.owner,
+      repo: this.repo,
+      alertNumbers: this.alertNumbers,
+      branch: this.branch,
+      status: this.status,
+      createdAt: this.createdAt,
+      sdkSessionId: this.sdkSessionId,
+      workspace: this.workspace,
+      defaultBranch: this.defaultBranch,
+      history: this.history,
+    });
   }
 }
 
@@ -364,14 +499,22 @@ export class SessionConflictError extends Error {
   }
 }
 
-/** 実行中のセッションをメモリ上で管理する */
+/** セッションを管理する。保存済みのセッションは、起動時に再開待ちの状態で読み込む */
 export class SessionManager {
   private readonly sessions = new Map<string, AgentSession>();
 
-  constructor(private readonly deps: AgentSessionDeps) {}
+  constructor(
+    private readonly deps: AgentSessionDeps,
+    restored: StoredSession[] = [],
+  ) {
+    for (const stored of restored) {
+      const session = new AgentSession(stored.owner, stored.repo, stored.alertNumbers, deps, stored);
+      this.sessions.set(session.id, session);
+    }
+  }
 
   create(owner: string, repo: string, alertNumbers: number[]): AgentSession {
-    const existing = [...this.sessions.values()].find((s) => s.active && s.owner === owner && s.repo === repo);
+    const existing = this.list(owner, repo).find((s) => s.active);
     if (existing) throw new SessionConflictError(existing.id);
     const session = new AgentSession(owner, repo, alertNumbers, this.deps);
     this.sessions.set(session.id, session);
@@ -383,7 +526,13 @@ export class SessionManager {
     return this.sessions.get(id);
   }
 
-  closeAll(): void {
-    for (const session of this.sessions.values()) session.close();
+  /** リポジトリのセッションを新しい順に返す */
+  list(owner: string, repo: string): AgentSession[] {
+    return [...this.sessions.values()].filter((s) => s.owner === owner && s.repo === repo).reverse();
+  }
+
+  /** サーバーの停止時に呼ぶ */
+  suspendAll(): void {
+    for (const session of this.sessions.values()) session.suspend();
   }
 }

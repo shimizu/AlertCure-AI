@@ -1,5 +1,6 @@
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it, vi } from "vitest";
+import { SessionStore } from "../db/sessions.js";
 import type { GitHubService } from "../github/service.js";
 import type { DependabotAlert } from "../types.js";
 import type { ServerEvent } from "./events.js";
@@ -41,6 +42,12 @@ describe("translate", () => {
     expect(translate(result)).toEqual([{ type: "result", isError: false, costUsd: 0.12, durationMs: 3000, numTurns: 2 }]);
   });
 
+  it("explains API errors", () => {
+    expect(translate(msg({ type: "assistant", parent_tool_use_id: null, error: "authentication_failed", message: { content: [] } }))).toEqual([
+      { type: "error", message: expect.stringContaining("ANTHROPIC_API_KEY") },
+    ]);
+  });
+
   it("ignores subagent output and reports execution errors", () => {
     expect(translate(delta("x", "parent"))).toEqual([]);
     expect(
@@ -68,7 +75,7 @@ function fakeQuery(replies: SDKMessage[][]) {
   return { runQuery, prompts, getOptions: () => options };
 }
 
-function setup(replies: SDKMessage[][], alerts: DependabotAlert[] = [alert]) {
+function setup(replies: SDKMessage[][], alerts: DependabotAlert[] = [alert], store?: SessionStore) {
   const fake = fakeQuery(replies);
   const github = {
     listRepos: vi.fn(),
@@ -80,10 +87,11 @@ function setup(replies: SDKMessage[][], alerts: DependabotAlert[] = [alert]) {
     run: vi.fn(async (_dir: string, args: string[]) => (args[0] === "log" ? "abc fix: nanoid\n" : "")),
     push: vi.fn(async () => {}),
   };
-  const session = new AgentSession("octo", "app", [7], { github, workspaces, runQuery: fake.runQuery, model: "test-model" });
+  const deps = { github, workspaces, runQuery: fake.runQuery, model: "test-model", store };
+  const session = new AgentSession("octo", "app", [7], deps);
   const events: ServerEvent[] = [];
   session.subscribe((e) => events.push(e));
-  return { session, events, workspaces, ...fake };
+  return { session, events, workspaces, deps, ...fake };
 }
 
 describe("AgentSession", () => {
@@ -169,6 +177,64 @@ describe("AgentSession", () => {
   });
 });
 
+describe("persistence", () => {
+  it("saves the session and resumes the SDK session after a restart", async () => {
+    const store = new SessionStore(":memory:");
+    const first = setup([[delta("分析しました"), result]], [alert], store);
+    void first.session.start();
+    await vi.waitFor(() => expect(first.session.status).toBe("idle"));
+    first.session.suspend();
+
+    const [saved] = store.list();
+    expect(saved).toMatchObject({ status: "idle", sdkSessionId: "sdk-1", defaultBranch: "main", branch: "alertcure/fix-7" });
+    expect(saved!.history).toContainEqual({ type: "assistant_delta", text: "分析しました" });
+
+    // 再起動後: 再開待ちの状態で読み込まれ、次のメッセージで resume する
+    const second = fakeQuery([[delta("続けます"), result]]);
+    const manager = new SessionManager({ ...first.deps, runQuery: second.runQuery }, store.list());
+    const restored = manager.get(first.session.id)!;
+    expect(restored.status).toBe("suspended");
+    expect(manager.list("octo", "app").map((s) => s.id)).toEqual([first.session.id]);
+
+    restored.send("続きをお願いします");
+    await vi.waitFor(() => expect(restored.status).toBe("idle"));
+    expect(first.workspaces.run).toHaveBeenCalledWith("/ws/octo/app", ["checkout", "alertcure/fix-7"]);
+    expect(second.getOptions()).toMatchObject({ resume: "sdk-1", cwd: "/ws/octo/app" });
+    expect(second.prompts).toEqual(["続きをお願いします"]);
+    manager.suspendAll();
+    store.close();
+  });
+
+  it("cancels approvals and tool calls that were pending when the server stopped", () => {
+    const store = new SessionStore(":memory:");
+    store.save({
+      id: "s1",
+      owner: "octo",
+      repo: "app",
+      alertNumbers: [7],
+      branch: "alertcure/fix-7",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      sdkSessionId: "sdk-1",
+      workspace: { dir: "/ws/octo/app", branch: "alertcure/fix-7", baseSha: "base" },
+      defaultBranch: "main",
+      history: [
+        { type: "tool_use", id: "t1", name: "Read", input: {} },
+        { type: "tool_result", toolUseId: "t1", isError: false, content: "ok" },
+        { type: "tool_use", id: "t2", name: "Grep", input: {} },
+        { type: "approval_request", id: "a1", toolName: "Bash", title: "t", reason: "r", input: {}, preview: null },
+      ],
+    });
+    const manager = new SessionManager({ github: {} as GitHubService, workspaces: { prepare: vi.fn(), run: vi.fn(), push: vi.fn() } }, store.list());
+    const events: ServerEvent[] = [];
+    manager.get("s1")!.subscribe((e) => events.push(e));
+    expect(events).toContainEqual({ type: "approval_resolved", id: "a1", approved: false });
+    expect(events.filter((e) => e.type === "tool_result").map((e) => (e as { toolUseId: string }).toolUseId)).toEqual(["t1", "t2"]);
+    expect(events.at(-1)).toMatchObject({ type: "status", status: "suspended" });
+    store.close();
+  });
+});
+
 describe("SessionManager", () => {
   it("refuses a second active session for the same repository", () => {
     const github = { listAlerts: vi.fn(() => new Promise(() => {})), getDefaultBranch: vi.fn(async () => "main") } as unknown as GitHubService;
@@ -179,7 +245,7 @@ describe("SessionManager", () => {
     expect(manager.create("octo", "other", [1])).toBeDefined();
     first.close();
     expect(manager.create("octo", "app", [2])).toBeDefined();
-    manager.closeAll();
+    manager.suspendAll();
   });
 
   it("names branches by sorted alert numbers", () => {
